@@ -167,11 +167,22 @@ def download_youtube_audio(url: str, output_dir: Optional[str] = None) -> Tuple[
     if ffdir:
         opts["ffmpeg_location"] = ffdir
 
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        title = info.get("title") or "audio"
-        vid = info.get("id") or ""
-        expected = os.path.splitext(ydl.prepare_filename(info))[0] + ".mp3"
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            title = info.get("title") or "audio"
+            vid = info.get("id") or ""
+            expected = os.path.splitext(ydl.prepare_filename(info))[0] + ".mp3"
+    except Exception as exc:
+        detail = str(exc).replace("\n", " ")[-250:]
+        raise RuntimeError(
+            "No pude descargar ese video.\n"
+            "• Revisa el enlace y tu internet.\n"
+            "• YouTube cambia seguido: vuelve a generar el .exe (Actions → Run workflow) para traer el yt-dlp más nuevo.\n"
+            "• Las versiones recientes pueden necesitar Deno: winget install DenoLand.Deno\n"
+            "• Alternativa: baja el MP3 con otra herramienta y ábrelo con «Abrir audio».\n\n"
+            f"Detalle: {detail}"
+        )
 
     if os.path.exists(expected):
         return expected, title
@@ -285,6 +296,7 @@ def analyze_song(y: np.ndarray, sr: int = ANALYSIS_SR) -> Dict[str, Any]:
         "key": (root, minor, corr),
         "chords": chords,
         "beats": beat_times,
+        "chroma": chroma,
     }
 
 
@@ -448,25 +460,24 @@ def notes_to_midi_file(
 
 
 # ----------------------------------------------------------------------
-# Buscar un tarareo dentro de una canción
+# Buscar un tarareo: dentro de una canción y entre toda tu biblioteca
 # ----------------------------------------------------------------------
-def find_melody_in_song(
-    hum_y: np.ndarray, song_y: np.ndarray, sr: int = ANALYSIS_SR, top: int = 3
-) -> List[Dict[str, Any]]:
-    """
-    Busca en qué parte de la canción suena una melodía tarareada.
-    Compara el contorno armónico (chroma) con DTW, probando las 12 transposiciones,
-    así que funciona aunque tarareaste en otro tono o a otra velocidad.
-    """
+def _hum_chroma(hum_y: np.ndarray, sr: int = ANALYSIS_SR, hop: int = 1024):
     hum_y, _ = librosa.effects.trim(hum_y, top_db=30)
     if len(hum_y) < sr * 1.0:
-        return []
-    hop = 1024
+        return None, 0.0
     hc = librosa.feature.chroma_cqt(y=hum_y, sr=sr, hop_length=hop) + 1e-6
-    sc = librosa.feature.chroma_cqt(y=song_y, sr=sr, hop_length=hop) + 1e-6
-    n = hc.shape[1]
-    hum_dur = len(hum_y) / sr
+    return hc, len(hum_y) / sr
 
+
+def _pool2(c: np.ndarray) -> np.ndarray:
+    m = c.shape[1] // 2 * 2
+    return c[:, :m].reshape(c.shape[0], -1, 2).mean(axis=2) if m >= 2 else c
+
+
+def _match(hc: np.ndarray, sc: np.ndarray, hop_s: float, hum_dur: float, top: int) -> List[Dict[str, Any]]:
+    """DTW de subsecuencia probando las 12 transposiciones (el tarareo puede estar en otro tono)."""
+    n = hc.shape[1]
     best_cost = np.full(sc.shape[1], np.inf)
     best_rot = np.zeros(sc.shape[1], dtype=int)
     for k in range(12):
@@ -476,22 +487,139 @@ def find_melody_in_song(
         best_cost[better] = cost[better]
         best_rot[better] = k
 
-    spacing = max(1, int(8.0 * sr / hop))
-    peaks, _ = find_peaks(-best_cost, distance=spacing)
+    peaks, _ = find_peaks(-best_cost, distance=max(1, int(8.0 / hop_s)))
     if len(peaks) == 0:
         peaks = np.array([int(np.argmin(best_cost))])
     peaks = sorted(peaks, key=lambda j: best_cost[j])[:top]
-
     med = float(np.median(best_cost[np.isfinite(best_cost)])) + 1e-9
-    results = []
+    out = []
     for j in peaks:
-        end = float(j * hop / sr)
+        end = float(j * hop_s)
         k = int(best_rot[j])
-        shift = k if k <= 6 else k - 12  # semitonos que hay que subir el tarareo para encajar
-        results.append({
+        out.append({
             "start": max(0.0, end - hum_dur),
             "end": end,
             "score": float(max(0.0, 1.0 - best_cost[j] / med)),
-            "semitones": shift,
+            "semitones": k if k <= 6 else k - 12,
         })
-    return results
+    return out
+
+
+def find_melody_in_song(hum_y: np.ndarray, song_y: np.ndarray, sr: int = ANALYSIS_SR, top: int = 3):
+    """En qué parte de ESTA canción suena la melodía tarareada."""
+    hc, dur = _hum_chroma(hum_y, sr)
+    if hc is None:
+        return []
+    sc = librosa.feature.chroma_cqt(y=song_y, sr=sr, hop_length=1024) + 1e-6
+    return _match(hc, sc, 1024 / sr, dur, top)
+
+
+# --- Biblioteca: cada canción que abres queda indexada para poder identificar tarareos ---
+def library_dir() -> Path:
+    d = Path.home() / "MusicHelper" / "biblioteca"
+    (d / "indice").mkdir(parents=True, exist_ok=True)
+    (d / "audio").mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def library_files() -> List[Path]:
+    return sorted((library_dir() / "indice").glob("*.npz"))
+
+
+def _entry_file(path: str) -> Path:
+    import hashlib
+    st = os.stat(path)
+    key = hashlib.md5(f"{os.path.abspath(path)}|{st.st_size}".encode()).hexdigest()[:16]
+    return library_dir() / "indice" / f"{key}.npz"
+
+
+def save_to_library(path: str, title: str, chroma: np.ndarray, duration: float) -> None:
+    np.savez_compressed(
+        _entry_file(path), chroma=chroma.astype(np.float16), title=np.array(title),
+        path=np.array(os.path.abspath(path)), duration=np.array(duration),
+    )
+
+
+def index_audio_file(path: str) -> bool:
+    """Agrega un archivo a la biblioteca. Devuelve False si ya estaba."""
+    f = _entry_file(path)
+    if f.exists():
+        return False
+    y, _ = load_audio(path, ANALYSIS_SR)
+    chroma = librosa.feature.chroma_cqt(y=y, sr=ANALYSIS_SR, hop_length=1024)
+    save_to_library(path, Path(path).stem, chroma, len(y) / ANALYSIS_SR)
+    return True
+
+
+def persist_download(path: str) -> str:
+    """Copia lo descargado de YouTube a la biblioteca para que no se pierda."""
+    dest = library_dir() / "audio" / Path(path).name
+    if not dest.exists():
+        shutil.copy2(path, dest)
+    return str(dest)
+
+
+def identify_hum(hum_y: np.ndarray, progress=None, top: int = 5, sr: int = ANALYSIS_SR) -> List[Dict[str, Any]]:
+    """Compara el tarareo con todas las canciones de la biblioteca y las ordena."""
+    hc, dur = _hum_chroma(hum_y, sr)
+    if hc is None:
+        return []
+    hc = _pool2(hc)
+    files = library_files()
+    results = []
+    for i, f in enumerate(files, 1):
+        try:
+            z = np.load(f, allow_pickle=False)
+            sc = _pool2(z["chroma"].astype(np.float32) + 1e-6)
+            title, p = str(z["title"]), str(z["path"])
+        except Exception:
+            continue
+        m = _match(hc, sc, 2048 / sr, dur, 1)
+        if m:
+            results.append({**m[0], "title": title, "path": p})
+        if progress:
+            progress(i, len(files))
+    results.sort(key=lambda r: -r["score"])
+    return results[:top]
+
+
+# ----------------------------------------------------------------------
+# Diagnóstico del sistema
+# ----------------------------------------------------------------------
+def diagnostics() -> List[str]:
+    import urllib.request
+    out: List[str] = []
+
+    def line(good: bool, text: str, hint: str = "") -> None:
+        out.append(("[OK]     " if good else "[FALLA]  ") + text + ("" if good or not hint else "  →  " + hint))
+
+    line(bool(get_ffmpeg_dir()), "FFmpeg incluido", "reinstala las dependencias")
+    sd = None
+    try:
+        import sounddevice as sd  # noqa
+    except Exception:
+        pass
+    try:
+        line(True, "Salida de audio: " + sd.query_devices(kind="output")["name"])
+    except Exception:
+        line(False, "Salida de audio", "conecta parlantes o audífonos")
+    try:
+        line(True, "Micrófono: " + sd.query_devices(kind="input")["name"])
+    except Exception:
+        line(False, "Micrófono", "conéctalo y activa Configuración → Privacidad → Micrófono (apps de escritorio)")
+    try:
+        from yt_dlp.version import __version__ as v
+        line(True, f"yt-dlp versión {v}")
+    except Exception:
+        line(False, "yt-dlp", "reinstala las dependencias")
+    rt = [r for r in ("deno", "node", "bun") if shutil.which(r)]
+    out.append(("[OK]     Runtime JavaScript: " + ", ".join(rt)) if rt else
+               "[AVISO]  No hay Deno/Node: YouTube puede fallar con videos nuevos  →  winget install DenoLand.Deno")
+    for name, url in (("Internet / YouTube", "https://www.youtube.com"), ("Letras (LRCLIB)", "https://lrclib.net")):
+        try:
+            urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"}), timeout=8)
+            line(True, name)
+        except Exception:
+            line(False, name, "sin conexión o bloqueado por la red")
+    out.append(f"Canciones en la biblioteca: {len(library_files())}  ({library_dir()})")
+    return out

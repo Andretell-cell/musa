@@ -57,7 +57,9 @@ Ejecuta `CREAR_EXE.bat`. Queda en `dist\MusicHelper\MusicHelper.exe`.
 | Acordes | Solo mayores y menores; son una guía para empezar |
 | Letras online | Busca en LRCLIB. Si trae tiempos, se ve la línea actual arriba |
 | Tarareo: buscar en la canción | Funciona aunque tarareaste en otro tono o a otra velocidad |
-| Identificar una canción desconocida | Necesita una base de datos externa que esta app no tiene. Usa el código Parsons en Musipedia o la búsqueda por tarareo de Google / SoundHound |
+| ¿Qué canción es? (tarareo) | Compara tu tarareo con tu **biblioteca**: cada canción que abres, descargas o agregas desde una carpeta queda indexada en `~/MusicHelper/biblioteca`. Solo reconoce canciones que ya tienes |
+| Canción que no tienes | Necesita una base de datos externa. Usa el código Parsons en Musipedia o la búsqueda por tarareo de Google / SoundHound |
+| Diagnóstico | Pestaña Ayuda → «Diagnóstico del sistema»: revisa audio, micrófono, internet, YouTube y FFmpeg |
 
 Los errores se guardan en `MusicHelper_errores.log`, en tu carpeta de usuario.
 

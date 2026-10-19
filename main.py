@@ -33,6 +33,8 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 
 from core import audio_utils as au
+from core import guitar
+from core import musicxml as mxl
 from core import lyrics as lyr
 from core.player import AudioPlayer
 
@@ -44,6 +46,40 @@ SPEEDS = ["0.5x", "0.6x", "0.7x", "0.75x", "0.8x", "0.9x", "1.0x", "1.1x", "1.25
 SEMIS = [f"{i:+d}" if i else "0" for i in range(-6, 7)]
 
 
+def draw_chord(canvas, x, y, frets, title, color="#4aa3ff", text_color="#ffffff"):
+    """Dibuja un diagrama de acorde de guitarra (cuerda 6 a la izquierda)."""
+    sp, fh = 14, 15
+    gx, gy = x + 18, y + 40
+    played = [f for f in frets if f > 0]
+    base = 1 if (not played or max(played) <= 5) else min(played)
+    canvas.create_text(x + 53, y + 9, text=title, fill=text_color, font=("Segoe UI", 11, "bold"))
+    for st in range(6):
+        canvas.create_line(gx + st * sp, gy, gx + st * sp, gy + 5 * fh, fill="#8a8a8a")
+    for fr in range(6):
+        w = 3 if (fr == 0 and base == 1) else 1
+        canvas.create_line(gx, gy + fr * fh, gx + 5 * sp, gy + fr * fh, fill="#8a8a8a", width=w)
+    if base > 1:
+        canvas.create_text(x + 6, gy + fh / 2, text=str(base), fill="#aaaaaa", font=("Segoe UI", 8))
+    for st, f in enumerate(frets):
+        cx = gx + st * sp
+        if f < 0:
+            canvas.create_text(cx, gy - 9, text="x", fill="#aaaaaa", font=("Segoe UI", 9))
+        elif f == 0:
+            canvas.create_oval(cx - 4, gy - 13, cx + 4, gy - 5, outline="#aaaaaa")
+    if played:
+        m = min(played)
+        idx = [st for st, f in enumerate(frets) if f == m]
+        if len(idx) >= 2 and idx[-1] - idx[0] >= 2 and all(f >= m for f in frets[idx[0]:idx[-1] + 1]):
+            cy = gy + (m - base) * fh + fh / 2
+            canvas.create_line(gx + idx[0] * sp, cy, gx + idx[-1] * sp, cy, fill=color, width=9,
+                               capstyle="round")
+    for st, f in enumerate(frets):
+        if f > 0:
+            cx = gx + st * sp
+            cy = gy + (f - base) * fh + fh / 2
+            canvas.create_oval(cx - 5, cy - 5, cx + 5, cy + 5, fill=color, outline="")
+
+
 def fmt_time(s: float) -> str:
     s = max(0.0, float(s))
     return f"{int(s // 60)}:{int(s % 60):02d}"
@@ -53,8 +89,9 @@ class MusicHelperApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("Music Helper - Aprende canciones")
-        self.geometry("1040x800")
-        self.minsize(920, 700)
+        h = min(880, max(620, self.winfo_screenheight() - 90))
+        self.geometry(f"1040x{h}")
+        self.minsize(860, 520)
 
         self.player = AudioPlayer()
         self.temp_dir = tempfile.mkdtemp(prefix="music_helper_")
@@ -74,6 +111,8 @@ class MusicHelperApp(ctk.CTk):
         self.hum_y = None
         self.hum_notes = []
         self.hum_matches = []
+        self.id_results = []
+        self._pending_seek = None
         self.solfege = True
 
         self._q = queue.Queue()
@@ -82,9 +121,11 @@ class MusicHelperApp(ctk.CTk):
         self._rec_buf = None
         self._playhead = None
         self._last_chord = None
+        self._last_chord_i = None
         self._last_lyric = None
 
         self._build_ui()
+        self._refresh_lib_label()
         self.bind("<space>", self._on_space)
         self.bind("<Left>", lambda e: self._nudge(-5))
         self.bind("<Right>", lambda e: self._nudge(5))
@@ -175,7 +216,12 @@ class MusicHelperApp(ctk.CTk):
     # Construcción de la interfaz
     # ==================================================================
     def _build_ui(self):
-        top = ctk.CTkFrame(self)
+        self.status = ctk.CTkLabel(self, text="Listo", anchor="w", text_color="gray")
+        self.status.pack(side="bottom", fill="x", padx=16, pady=(0, 8))
+        self.main = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        self.main.pack(fill="both", expand=True)
+
+        top = ctk.CTkFrame(self.main)
         top.pack(fill="x", padx=12, pady=(12, 6))
         ctk.CTkLabel(top, text="Music Helper", font=ctk.CTkFont(size=20, weight="bold")).pack(
             side="left", padx=10, pady=8)
@@ -187,7 +233,7 @@ class MusicHelperApp(ctk.CTk):
         self.notation.set("Do Re Mi")
         self.notation.pack(side="left", padx=(14, 4))
 
-        info = ctk.CTkFrame(self)
+        info = ctk.CTkFrame(self.main)
         info.pack(fill="x", padx=12, pady=6)
         self.lbl_title = ctk.CTkLabel(info, text="Ningún archivo cargado", font=ctk.CTkFont(size=14))
         self.lbl_title.pack(anchor="w", padx=12, pady=(8, 0))
@@ -198,12 +244,14 @@ class MusicHelperApp(ctk.CTk):
         ctk.CTkLabel(row, text="Acorde:", text_color="gray").pack(side="left")
         self.lbl_chord = ctk.CTkLabel(row, text="—", width=90, anchor="w",
                                       font=ctk.CTkFont(size=26, weight="bold"))
-        self.lbl_chord.pack(side="left", padx=(6, 18))
+        self.lbl_chord.pack(side="left", padx=(6, 8))
+        self.chord_canvas = tk.Canvas(row, width=215, height=118, bg="#2b2b2b", highlightthickness=0)
+        self.chord_canvas.pack(side="left", padx=(0, 14))
         self.lbl_lyric = ctk.CTkLabel(row, text="", anchor="w", justify="left", font=ctk.CTkFont(size=14))
         self.lbl_lyric.pack(side="left", fill="x", expand=True)
 
         # --- Reproductor ---
-        pf = ctk.CTkFrame(self)
+        pf = ctk.CTkFrame(self.main)
         pf.pack(fill="x", padx=12, pady=6)
         seek_row = ctk.CTkFrame(pf, fg_color="transparent")
         seek_row.pack(fill="x", padx=12, pady=(10, 2))
@@ -244,21 +292,20 @@ class MusicHelperApp(ctk.CTk):
         ctk.CTkLabel(lp, text="Espacio = play/pausa, flechas = ±5 s", text_color="gray").pack(side="right", padx=6)
 
         # --- Pestañas ---
-        self.tabs = ctk.CTkTabview(self)
-        self.tabs.pack(fill="both", expand=True, padx=12, pady=8)
+        self.tabs = ctk.CTkTabview(self.main, height=470)
+        self.tabs.pack(fill="x", padx=12, pady=8)
         self.tab_notes = self.tabs.add("Notas / MIDI")
         self.tab_chords = self.tabs.add("Acordes")
+        self.tab_tab = self.tabs.add("Tablatura")
         self.tab_lyrics = self.tabs.add("Letras")
         self.tab_hum = self.tabs.add("Tarareo / Silbido")
         self.tab_help = self.tabs.add("Ayuda")
         self._build_notes_tab()
         self._build_chords_tab()
+        self._build_tab_tab()
         self._build_lyrics_tab()
         self._build_hum_tab()
         self._build_help_tab()
-
-        self.status = ctk.CTkLabel(self, text="Listo", anchor="w", text_color="gray")
-        self.status.pack(fill="x", padx=16, pady=(0, 8))
 
     def _build_notes_tab(self):
         t = ctk.CTkFrame(self.tab_notes, fg_color="transparent")
@@ -276,6 +323,8 @@ class MusicHelperApp(ctk.CTk):
         ctk.CTkButton(t2, text="Escuchar notas", width=120, command=self.listen_notes).pack(side="left", padx=4)
         ctk.CTkButton(t2, text="Parar sonido", width=100, command=self._stop_sound).pack(side="left", padx=4)
         ctk.CTkButton(t2, text="Exportar MIDI", width=110, command=self.export_midi).pack(side="left", padx=4)
+        ctk.CTkButton(t2, text="Exportar MusicXML", width=140, command=self.export_musicxml).pack(
+            side="left", padx=4)
         ctk.CTkButton(t2, text="Copiar notas", width=100, command=self.copy_notes).pack(side="left", padx=4)
 
         self.roll = tk.Canvas(self.tab_notes, height=170, bg="#1e1e1e", highlightthickness=0)
@@ -295,11 +344,24 @@ class MusicHelperApp(ctk.CTk):
     def _build_chords_tab(self):
         ctk.CTkLabel(
             self.tab_chords,
-            text="Acordes estimados (mayores y menores) por compás aproximado. Son una guía, no una verdad absoluta.",
-            text_color="gray").pack(anchor="w", padx=10, pady=(8, 2))
+            text="Acordes estimados (mayores y menores). Son una guía, no una verdad absoluta.\n"
+                 "Diagramas de guitarra de los más usados (cuerda grave a la izquierda; x = no se toca, o = al aire).",
+            text_color="gray", justify="left").pack(anchor="w", padx=10, pady=(8, 2))
+        self.chord_legend = tk.Canvas(self.tab_chords, height=120, bg="#2b2b2b", highlightthickness=0)
+        self.chord_legend.pack(fill="x", padx=8, pady=(2, 4))
         self.chords_text = ctk.CTkTextbox(self.tab_chords, font=ctk.CTkFont(family="Consolas", size=14))
         self.chords_text.pack(fill="both", expand=True, padx=8, pady=8)
         self.chords_text.insert("1.0", "Los acordes aparecen aquí al cargar una canción.")
+
+    def _build_tab_tab(self):
+        r = ctk.CTkFrame(self.tab_tab, fg_color="transparent")
+        r.pack(fill="x", padx=6, pady=(8, 4))
+        ctk.CTkButton(r, text="Copiar tablatura", width=130, command=self.copy_tab).pack(side="left", padx=4)
+        ctk.CTkLabel(r, text="Se genera sola al analizar la melodía en «Notas / MIDI».",
+                     text_color="gray").pack(side="left", padx=10)
+        self.tab_box = ctk.CTkTextbox(self.tab_tab, font=ctk.CTkFont(family="Consolas", size=14), wrap="none")
+        self.tab_box.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.tab_box.insert("1.0", "Analiza la melodía en «Notas / MIDI» y aquí aparece la tablatura para guitarra.")
 
     def _build_lyrics_tab(self):
         s = ctk.CTkFrame(self.tab_lyrics, fg_color="transparent")
@@ -331,10 +393,9 @@ class MusicHelperApp(ctk.CTk):
     def _build_hum_tab(self):
         ctk.CTkLabel(
             self.tab_hum, justify="left",
-            text=("Tararea o silba una melodía y la app saca las notas.\n"
-                  "Con una canción cargada, también busca en qué parte suena esa melodía.\n"
-                  "Para saber qué canción es sin tenerla, usa el código Parsons en Musipedia\n"
-                  "o la búsqueda por tarareo de Google / SoundHound en tu celular.")
+            text=("1) Graba tu tarareo o silbido (o carga un archivo).   2) Pulsa «¿Qué canción es?».\n"
+                  "La app compara con TUS canciones: cada canción que abres o agregas a la biblioteca queda indexada.\n"
+                  "Para una canción que no tienes, usa el código Parsons en Musipedia o la búsqueda por tarareo de Google.")
         ).pack(anchor="w", padx=10, pady=(8, 4))
 
         r = ctk.CTkFrame(self.tab_hum, fg_color="transparent")
@@ -361,6 +422,17 @@ class MusicHelperApp(ctk.CTk):
         ctk.CTkButton(r2, text="Código Parsons + Musipedia", width=200, command=self.open_musipedia).pack(
             side="left", padx=4)
 
+        r3 = ctk.CTkFrame(self.tab_hum, fg_color="transparent")
+        r3.pack(fill="x", padx=6, pady=4)
+        ctk.CTkButton(r3, text="¿Qué canción es?", width=150, command=self.identify_in_library).pack(
+            side="left", padx=4)
+        ctk.CTkButton(r3, text="Abrir mejor resultado", width=160, command=self.open_best_id).pack(
+            side="left", padx=4)
+        ctk.CTkButton(r3, text="Agregar carpeta de música", width=190, command=self.add_folder_to_library).pack(
+            side="left", padx=4)
+        self.lbl_lib = ctk.CTkLabel(r3, text="Biblioteca: 0 canciones", text_color="gray")
+        self.lbl_lib.pack(side="left", padx=10)
+
         self.hum_text = ctk.CTkTextbox(self.tab_hum, font=ctk.CTkFont(family="Consolas", size=13))
         self.hum_text.pack(fill="both", expand=True, padx=8, pady=(4, 8))
 
@@ -385,11 +457,17 @@ class MusicHelperApp(ctk.CTk):
    «Escuchar notas» reproduce lo detectado para que compruebes si salió bien.
    «Exportar MIDI» lo abre en MuseScore, Guitar Pro, etc.
 
-5. Letras
+5. Guitarra: acordes, tablatura y partitura
+   Junto al acorde grande verás el diagrama de dedos (ahora y el siguiente).
+   En «Acordes» están los diagramas de los más usados y la digitación de cada uno.
+   En «Tablatura» sale la melodía para guitarra (se genera al analizar las notas).
+   «Exportar MusicXML» crea la partitura para abrirla en MuseScore.
+
+6. Letras
    Busca por artista y título (LRCLIB, gratis). Si trae tiempos, funciona como karaoke.
    Whisper (opcional) transcribe del audio; solo disponible al ejecutar desde el código.
 
-6. Tarareo / silbido
+7. Tarareo / silbido
    Graba (8, 15 o 30 s) o carga un archivo. Obtienes las notas y el código Parsons.
    «Buscar en la canción cargada» te dice en qué parte suena tu melodía, aunque la
    hayas tarareado en otro tono o a otra velocidad.
@@ -399,12 +477,22 @@ Límites
 - Los acordes son solo mayores y menores. Son una guía para empezar a sacar la canción.
 - Identificar una canción desconocida por tarareo necesita una base de datos externa.
   Aquí no hay una: por eso se ofrece el código Parsons y el buscador de la canción cargada.
+- Si algo no funciona, usa el botón «Diagnóstico del sistema» (arriba).
 - Los errores se guardan en el archivo MusicHelper_errores.log de tu carpeta de usuario.
 """
+        bar = ctk.CTkFrame(self.tab_help, fg_color="transparent")
+        bar.pack(fill="x", padx=8, pady=(8, 0))
+        ctk.CTkButton(bar, text="Diagnóstico del sistema", width=190, command=self.run_diagnostics).pack(side="left")
+        ctk.CTkLabel(bar, text="Si algo no funciona (micrófono, YouTube, audio), pulsa aquí.",
+                     text_color="gray").pack(side="left", padx=10)
         box = ctk.CTkTextbox(self.tab_help, font=ctk.CTkFont(size=13))
         box.pack(fill="both", expand=True, padx=8, pady=8)
         box.insert("1.0", text)
         box.configure(state="disabled")
+
+    def run_diagnostics(self):
+        self._bg(au.diagnostics, lambda lines: messagebox.showinfo("Diagnóstico", "\n".join(lines)),
+                 "Revisando el sistema...")
 
     # ==================================================================
     # Cargar audio
@@ -428,6 +516,10 @@ Límites
 
         def done(res):
             path, title = res
+            try:
+                path = au.persist_download(path)
+            except Exception:
+                self._log(traceback.format_exc())
             self._load_path(path, title)
 
         self._bg(work, done, "Descargando audio de YouTube... (puede tardar)")
@@ -458,6 +550,11 @@ Límites
             self.notes, self.notes_range = [], (0.0, self.duration)
             self.lyric_lines, self.lyric_times = [], []
             self._last_chord = self._last_lyric = None
+            self._last_chord_i = None
+            self.chord_canvas.delete("all")
+            self.chord_legend.delete("all")
+            self.tab_box.delete("1.0", "end")
+            self.tab_box.insert("1.0", "Analiza la melodía en «Notas / MIDI» y aquí aparece la tablatura para guitarra.")
             self.lbl_chord.configure(text="—")
             self.lbl_lyric.configure(text="")
             self.loop_start.delete(0, "end")
@@ -473,6 +570,11 @@ Límites
             self._refresh_info()
             self.status.configure(text=f"Cargado: {name}")
             self._start_harmony(y22, lid)
+            if self._pending_seek is not None:
+                self.player.seek(self._pending_seek)
+                self.player.play()
+                self.btn_play.configure(text="Pausa")
+                self._pending_seek = None
 
         self._bg(work, done, f"Cargando {Path(path).name}...")
 
@@ -485,6 +587,11 @@ Límites
             self.chord_starts = [c["start"] for c in self.chords]
             self._refresh_info()
             self._refresh_chords()
+            try:
+                au.save_to_library(self.current_path, self.lbl_title.cget("text"), res["chroma"], res["duration"])
+                self._refresh_lib_label()
+            except Exception:
+                self._log(traceback.format_exc())
             self.status.configure(text="Listo: tempo, tonalidad y acordes calculados")
 
         def fail(err):
@@ -574,14 +681,11 @@ Límites
 
         if self.chord_starts:
             i = bisect.bisect_right(self.chord_starts, pos) - 1
-            if i >= 0 and pos <= self.chords[i]["end"] + 0.5:
-                c = self.chords[i]
-                txt = au.chord_name(c["root"], c["minor"], self.solfege)
-            else:
-                txt = "—"
-            if txt != self._last_chord:
-                self._last_chord = txt
-                self.lbl_chord.configure(text=txt)
+            if i >= 0 and pos > self.chords[i]["end"] + 0.5:
+                i = -1
+            if i != self._last_chord_i:
+                self._last_chord_i = i
+                self._show_chord_pair(i)
 
         if self.lyric_times:
             i = bisect.bisect_right(self.lyric_times, pos) - 1
@@ -603,12 +707,29 @@ Límites
         if p.pop_finished():
             self.btn_play.configure(text="Play")
 
+    def _show_chord_pair(self, i):
+        cv = self.chord_canvas
+        cv.delete("all")
+        if i < 0 or i >= len(self.chords):
+            self.lbl_chord.configure(text="—")
+            return
+        c = self.chords[i]
+        name = au.chord_name(c["root"], c["minor"], self.solfege)
+        self.lbl_chord.configure(text=name)
+        draw_chord(cv, 0, 0, guitar.chord_frets(c["root"], c["minor"]), name)
+        if i + 1 < len(self.chords):
+            n = self.chords[i + 1]
+            nname = au.chord_name(n["root"], n["minor"], self.solfege)
+            draw_chord(cv, 112, 0, guitar.chord_frets(n["root"], n["minor"]), "→ " + nname,
+                       color="#6b7a8f", text_color="#9aa5b5")
+
     # ==================================================================
     # Notación y textos
     # ==================================================================
     def _on_notation(self, value):
         self.solfege = value == "Do Re Mi"
         self._last_chord = None
+        self._last_chord_i = None
         self._refresh_info()
         self._refresh_chords()
         if self.notes:
@@ -634,11 +755,24 @@ Límites
     def _refresh_chords(self):
         if not self.chords:
             return
-        lines = ["  Tiempo   Acorde", "-" * 20]
+        lines = ["  Tiempo   Acorde   Digitación (cuerda 6 → 1)", "-" * 44]
         for c in self.chords:
-            lines.append(f"  {fmt_time(c['start']):>5}    {au.chord_name(c['root'], c['minor'], self.solfege)}")
+            name = au.chord_name(c["root"], c["minor"], self.solfege)
+            fing = guitar.fingering_text(guitar.chord_frets(c["root"], c["minor"]))
+            lines.append(f"  {fmt_time(c['start']):>5}    {name:<6}   {fing}")
         self.chords_text.delete("1.0", "end")
         self.chords_text.insert("1.0", "\n".join(lines))
+
+        # diagramas de los acordes más usados
+        totals = {}
+        for c in self.chords:
+            k = (c["root"], c["minor"])
+            totals[k] = totals.get(k, 0.0) + (c["end"] - c["start"])
+        top = sorted(totals, key=lambda k: -totals[k])[:8]
+        self.chord_legend.delete("all")
+        for n, (root, minor) in enumerate(top):
+            draw_chord(self.chord_legend, n * 108, 0, guitar.chord_frets(root, minor),
+                       au.chord_name(root, minor, self.solfege))
 
     # ==================================================================
     # Melodía → notas
@@ -699,6 +833,8 @@ Límites
         self.notes_text.delete("1.0", "end")
         self.notes_text.insert("1.0", self._notes_report(self.notes, t0, t1))
         self._draw_roll()
+        self.tab_box.delete("1.0", "end")
+        self.tab_box.insert("1.0", guitar.notes_to_tab(self.notes))
 
     def _draw_roll(self):
         c = self.roll
@@ -753,6 +889,34 @@ Límites
             messagebox.showinfo("Listo", f"MIDI guardado:\n{path}\n\nÁbrelo en MuseScore, Guitar Pro, etc.")
         except Exception as exc:
             messagebox.showerror("Error", str(exc))
+
+    def export_musicxml(self):
+        if not self.notes:
+            messagebox.showinfo("Aviso", "Primero analiza la melodía.")
+            return
+        base = Path(self.current_path).stem if self.current_path else "melodia"
+        path = filedialog.asksaveasfilename(
+            defaultextension=".musicxml", initialfile=base + ".musicxml",
+            filetypes=[("MusicXML", "*.musicxml *.xml"), ("Todos", "*.*")])
+        if not path:
+            return
+        try:
+            tempo = self.harmony["tempo"] if self.harmony else 120.0
+            key = self.harmony["key"] if self.harmony else None
+            mxl.notes_to_musicxml(self.notes, path, tempo=tempo, time_offset=self.notes_range[0],
+                                  key=key, title=base)
+            self.status.configure(text=f"MusicXML guardado: {path}")
+            messagebox.showinfo(
+                "Listo",
+                f"Partitura guardada:\n{path}\n\nÁbrela en MuseScore (gratis). El ritmo es aproximado: "
+                "revísalo y corrígelo ahí si hace falta.")
+        except Exception as exc:
+            messagebox.showerror("Error", str(exc))
+
+    def copy_tab(self):
+        self.clipboard_clear()
+        self.clipboard_append(self.tab_box.get("1.0", "end"))
+        self.status.configure(text="Tablatura copiada al portapapeles")
 
     def copy_notes(self):
         self.clipboard_clear()
@@ -913,6 +1077,7 @@ Límites
         def done(notes):
             self.hum_notes = notes
             self.hum_matches = []
+            self.id_results = []
             self._show_hum()
             self.status.configure(text=f"Tarareo analizado: {len(notes)} notas")
 
@@ -924,6 +1089,14 @@ Límites
         if notes:
             text += ("\n\nCódigo Parsons (contorno): " + au.parsons_code(notes) +
                      "\n(* = inicio, U = sube, D = baja, R = repite)")
+        if self.id_results:
+            text += "\n\n¿Qué canción podría ser? (entre tu biblioteca)\n"
+            for i, r in enumerate(self.id_results, 1):
+                text += f"  {i}. {r['title'][:50]}  —  {r['score'] * 100:.0f}%  (cerca de {fmt_time(r['start'])})\n"
+            if self.id_results[0]["score"] < 0.25:
+                text += "Ninguna coincide con claridad: puede que esa canción no esté en tu biblioteca.\n"
+            else:
+                text += "Es orientativo: compara de oído con el primer resultado («Abrir mejor resultado»).\n"
         if self.hum_matches:
             text += "\n\nDónde suena en la canción cargada:\n"
             for i, m in enumerate(self.hum_matches, 1):
@@ -961,6 +1134,76 @@ Límites
         self.player.seek(self.hum_matches[0]["start"])
         self.player.play()
         self.btn_play.configure(text="Pausa")
+
+    def _refresh_lib_label(self):
+        try:
+            self.lbl_lib.configure(text=f"Biblioteca: {len(au.library_files())} canciones")
+        except Exception:
+            pass
+
+    def add_folder_to_library(self):
+        folder = filedialog.askdirectory(title="Carpeta con tu música")
+        if not folder:
+            return
+        exts = {".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".opus"}
+        files = [str(f) for f in Path(folder).rglob("*") if f.suffix.lower() in exts][:500]
+        if not files:
+            messagebox.showinfo("Biblioteca", "No encontré audios en esa carpeta.")
+            return
+
+        def work():
+            added = 0
+            for i, f in enumerate(files, 1):
+                try:
+                    added += int(au.index_audio_file(f))
+                except Exception:
+                    self._log(f"No se pudo indexar {f}\n" + traceback.format_exc())
+                self._post(lambda i=i: self.status.configure(text=f"Indexando música... {i}/{len(files)}"))
+            return added
+
+        def done(added):
+            self._refresh_lib_label()
+            self.status.configure(text=f"Biblioteca lista: {added} canciones nuevas")
+
+        self._bg(work, done, f"Indexando {len(files)} archivos (tarda un poco)...")
+
+    def identify_in_library(self):
+        if self.hum_y is None:
+            messagebox.showinfo("Aviso", "Primero graba o carga un tarareo.")
+            return
+        if not au.library_files():
+            messagebox.showinfo(
+                "Biblioteca vacía",
+                "Aún no hay canciones para comparar.\nAbre canciones con «Abrir audio» o «YouTube», "
+                "o usa «Agregar carpeta de música».")
+            return
+        hum = self.hum_y
+
+        def progress(i, n):
+            self._post(lambda: self.status.configure(text=f"Comparando con tus canciones... {i}/{n}"))
+
+        def done(res):
+            self.id_results = res
+            self._show_hum()
+            self.status.configure(text="Comparación lista" if res else "El tarareo es muy corto")
+
+        self._bg(lambda: au.identify_hum(hum, progress), done, "Comparando con tus canciones...")
+
+    def open_best_id(self):
+        if not self.id_results:
+            messagebox.showinfo("Aviso", "Primero pulsa «¿Qué canción es?».")
+            return
+        r = self.id_results[0]
+        if not os.path.exists(r["path"]):
+            messagebox.showerror("Archivo no encontrado", f"Ya no existe:\n{r['path']}")
+            return
+        if self.current_path and os.path.abspath(self.current_path) == r["path"] and self.player.loaded:
+            self.player.seek(r["start"])
+            self.player.play()
+            self.btn_play.configure(text="Pausa")
+        else:
+            self._pending_seek = r["start"]
+            self._load_path(r["path"], r["title"])
 
     def open_musipedia(self):
         if not self.hum_notes:

@@ -27,6 +27,7 @@ pyinstaller --noconfirm --clean --onedir --windowed --name MusicHelper ^
     --collect-all sounddevice ^
     --collect-all imageio_ffmpeg ^
     --collect-submodules yt_dlp ^
+    --collect-all yt_dlp_ejs ^
     main.py
 
 if exist "dist\MusicHelper\MusicHelper.exe" (

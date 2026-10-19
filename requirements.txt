@@ -4,6 +4,6 @@ scipy>=1.11
 librosa>=0.10.2
 soundfile>=0.12.1
 sounddevice>=0.4.6
-yt-dlp
+yt-dlp[default]
 imageio-ffmpeg>=0.5.1
 mido>=1.3
