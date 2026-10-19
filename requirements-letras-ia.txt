@@ -1,0 +1,2 @@
+# Opcional: transcribir letras con IA (solo al ejecutar desde el codigo)
+faster-whisper>=1.0.0
